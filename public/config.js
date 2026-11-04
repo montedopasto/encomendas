@@ -4,9 +4,9 @@
  */
 window.ENCOMENDAS_CONFIG = {
   // Registo da app no Microsoft Entra ID (Azure AD) — "Aplicação de página única (SPA)".
-  tenantId: 'COLOCAR-ID-DO-TENANT',          // ID do diretório (tenant) da Monte do Pasto
-  clientId: 'COLOCAR-ID-DA-APLICACAO',       // ID da aplicação (cliente)
-  redirectUri: '',                           // vazio = endereço da própria página (tem de estar registado no Entra)
+  tenantId: 'ee417351-ea90-41e0-9147-5ea6ab38ea49',          // ID do diretório (tenant) da Monte do Pasto
+  clientId: '9d1ce466-7e62-44f8-a46d-ad22694edb66',       // ID da aplicação (cliente)
+  redirectUri: 'https://montedopasto.github.io/encomendas/',                           // vazio = endereço da própria página (tem de estar registado no Entra)
 
   // Só entram contas deste domínio.
   domain: 'montedopasto.pt',
