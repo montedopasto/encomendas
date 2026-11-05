@@ -17,6 +17,9 @@
  */
 (function () {
   'use strict';
+  // Só funciona em HTTPS: em http o browser não dá a criptografia que a entrada Microsoft (MSAL) precisa.
+  const LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  if (location.protocol === 'http:' && !LOCAL) { location.replace('https://' + location.host + location.pathname + location.search + location.hash); return; }
   const CFG = window.ENCOMENDAS_CONFIG || {};
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const SCOPES = ['User.Read', 'Mail.ReadWrite', 'Mail.Send', 'Files.ReadWrite.All'];
@@ -44,10 +47,19 @@
     gate(LOGO + '<p><b>Instalação por concluir.</b></p><p>Falta preencher <code>config.js</code> com o registo da app no Microsoft Entra (clientId, tenantId) e a pasta SharePoint dos dados. Ver <code>docs/INSTALAR.md</code>.</p>');
     return;
   }
-  const pca = new msal.PublicClientApplication({
-    auth: { clientId: CFG.clientId, authority: 'https://login.microsoftonline.com/' + CFG.tenantId, redirectUri: CFG.redirectUri || (location.origin + location.pathname) },
-    cache: { cacheLocation: 'localStorage' }
-  });
+  // O regresso da entrada Microsoft tem de ser a esta mesma página (mesmo endereço): se o config.js aponta para outro
+  // endereço (ex.: o github.io quando o site está num domínio próprio), usa-se o da página.
+  const HERE = location.origin + location.pathname;
+  let REDIRECT = HERE;
+  try { if (CFG.redirectUri && new URL(CFG.redirectUri, location.href).origin === location.origin) REDIRECT = CFG.redirectUri; } catch (e) {}
+  if (!window.isSecureContext || !(window.crypto && window.crypto.subtle)) { gate(LOGO + '<p><b>Abra a app pelo endereço https://</b></p><p>A entrada Microsoft só funciona em ligação segura (HTTPS).</p>'); return; }
+  let pca;
+  try {
+    pca = new msal.PublicClientApplication({
+      auth: { clientId: CFG.clientId, authority: 'https://login.microsoftonline.com/' + CFG.tenantId, redirectUri: REDIRECT },
+      cache: { cacheLocation: 'localStorage' }
+    });
+  } catch (e) { gate(LOGO + '<p>Erro ao preparar a entrada Microsoft: ' + esc(e.message || e) + '</p>'); return; }
   let account = null;
 
   async function token() {
@@ -91,15 +103,24 @@
   const itemPath = (rel) => '/drives/' + encodeURIComponent(DRIVE) + '/items/' + encodeURIComponent(ROOT) + ':/' + enc(rel) + ':';
   const cache = {}; // caminho -> { etag, data }
 
+  /* Lê o conteúdo JSON de um ficheiro de dados. Usa o downloadUrl quando o Graph o dá; senão pede o /content
+     pelo id do ficheiro. Nunca faz fetch de um endereço vazio (dava a página 404 do site: "<!DOCTYPE ... is not valid JSON"). */
+  async function fileJson(item, label) {
+    const url = item && item['@microsoft.graph.downloadUrl'];
+    let r = null;
+    if (url) { try { r = await fetch(url); if (!r.ok) r = null; } catch (e) { r = null; } }
+    if (!r) r = await graph('/drives/' + encodeURIComponent(DRIVE) + '/items/' + encodeURIComponent(item.id) + '/content', { raw: true });
+    const txt = await r.text();
+    try { return txt ? JSON.parse(txt) : null; }
+    catch (e) { const err = new Error('O ficheiro de dados "' + label + '" não é JSON válido (pasta dados do SharePoint).'); err.code = 'bad_data'; throw err; }
+  }
   async function readDoc(path) {
     let meta;
-    try { meta = await graph(itemPath(path + '.json') + '?$select=id,eTag,@microsoft.graph.downloadUrl'); }
+    try { meta = await graph(itemPath(path + '.json')); }
     catch (e) { if (e.status === 404) { delete cache[path]; return { exists: false, data: null, etag: null }; } throw e; }
     const c = cache[path];
     if (c && c.etag === meta.eTag) return { exists: true, data: c.data, etag: meta.eTag };
-    const url = meta['@microsoft.graph.downloadUrl'];
-    const r = url ? await fetch(url) : await graph(itemPath(path + '.json') + '/content', { raw: true });
-    const data = await r.json();
+    const data = await fileJson(meta, path + '.json');
     cache[path] = { etag: meta.eTag, data };
     return { exists: true, data, etag: meta.eTag };
   }
@@ -116,7 +137,7 @@
   }
   async function listCol(path) {
     let res;
-    try { res = await graph(itemPath(path) + '/children?$select=name,eTag,file,@microsoft.graph.downloadUrl&$top=999'); }
+    try { res = await graph(itemPath(path) + '/children?$top=999'); }
     catch (e) { if (e.status === 404) return []; throw e; }
     let items = res.value || []; let next = res['@odata.nextLink'];
     while (next) { const r2 = await graph(next); items = items.concat(r2.value || []); next = r2['@odata.nextLink']; }
@@ -125,8 +146,7 @@
       const id = f.name.replace(/\.json$/i, ''); const p = path + '/' + id;
       const c = cache[p];
       if (c && c.etag === f.eTag) return { id, data: c.data };
-      const r = await fetch(f['@microsoft.graph.downloadUrl']);
-      const data = await r.json(); cache[p] = { etag: f.eTag, data };
+      const data = await fileJson(f, p + '.json'); cache[p] = { etag: f.eTag, data };
       return { id, data };
     }));
     return out;
