@@ -1,0 +1,9 @@
+{
+  "name": "encomendas-robo",
+  "private": true,
+  "description": "Robô da app Encomendas: importa o stock e trata os relatórios da Logifrio em segundo plano",
+  "main": "run.js",
+  "scripts": { "start": "node run.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "playwright": "1.49.1" }
+}

@@ -1,0 +1,48 @@
+name: Encomendas Robô
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2-57/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: encomendas-robo
+  cancel-in-progress: false
+
+jobs:
+  validar:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Validar sintaxe e ficheiros
+        run: |
+          node --check robo/run.js
+          node --check public/platform.js
+          test -s public/app.html
+          test -s public/config.js
+
+  executar:
+    if: github.event_name == 'schedule' && vars.ENCOMENDAS_ROBO_ATIVO == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    container:
+      image: mcr.microsoft.com/playwright:v1.49.1-jammy
+      options: --ipc=host
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Instalar dependências
+        working-directory: robo
+        run: npm install --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Executar robô
+        working-directory: robo
+        env:
+          TENANT_ID: ${{ secrets.ENCOMENDAS_ROBO_TENANT_ID }}
+          CLIENT_ID: ${{ secrets.ENCOMENDAS_ROBO_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.ENCOMENDAS_ROBO_CLIENT_SECRET }}
+          TZ: Europe/Lisbon
+        run: node run.js
