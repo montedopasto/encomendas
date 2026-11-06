@@ -21,6 +21,9 @@
   const LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
   if (location.protocol === 'http:' && !LOCAL) { location.replace('https://' + location.host + location.pathname + location.search + location.hash); return; }
   const CFG = window.ENCOMENDAS_CONFIG || {};
+  // Modo robô (robo/run.js): sem entrada Microsoft; o robô dá um token de aplicação e a caixa de correio (ex.: trueborn@).
+  // "/me" passa a ser essa caixa. Só existe quando o programa do robô o injeta na página — um browser normal nunca o tem.
+  const ROBOT = (window.__svRobot && typeof window.__svRobotToken === 'function') ? window.__svRobot : null;
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const SCOPES = ['User.Read', 'Mail.ReadWrite', 'Mail.Send', 'Files.ReadWrite.All'];
   const POLL_MS = CFG.pollMs || 15000;
@@ -63,6 +66,7 @@
   let account = null;
 
   async function token() {
+    if (ROBOT) return window.__svRobotToken();
     try { return (await pca.acquireTokenSilent({ scopes: SCOPES, account })).accessToken; }
     catch (e) {
       if (e instanceof msal.InteractionRequiredAuthError || /interaction_required|login_required|consent_required/.test(e.errorCode || '')) {
@@ -73,11 +77,15 @@
     }
   }
 
+  // Permissões extra (caixa partilhada): só em silêncio. Sem consentimento do administrador, falha e a app usa a conta da pessoa.
+  async function tokenExtra(scopes) { if (ROBOT) return window.__svRobotToken(); return (await pca.acquireTokenSilent({ scopes: SCOPES.concat(scopes), account })).accessToken; }
+
   // ------------------------------------------------------------------ Microsoft Graph
   class GraphError extends Error { constructor(status, body) { super((body && body.error && body.error.message) || ('HTTP ' + status)); this.status = status; this.body = body; this.code = status === 401 ? 'needs_reauth' : status === 403 ? 'tool_error' : status === 404 ? 'not_found' : status === 409 || status === 412 ? 'conflict' : status >= 500 ? 'server_unavailable' : 'tool_error'; } }
   async function graph(path, opts) {
     opts = opts || {};
-    const t = await token();
+    if (ROBOT && /^\/me(\/|\?|$)/.test(path)) path = '/users/' + encodeURIComponent(ROBOT.mailbox) + path.slice(3);
+    const t = opts.scopes ? await tokenExtra(opts.scopes) : await token();
     const headers = Object.assign({ Authorization: 'Bearer ' + t }, opts.headers || {});
     let body = opts.body;
     if (body !== undefined && !(body instanceof Blob) && !(body instanceof ArrayBuffer) && typeof body !== 'string') { body = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
@@ -243,7 +251,10 @@
 
   // ------------------------------------------------------------------ "conectores": Microsoft 365 pelo Graph
   const result = (payload) => ({ payload, content: [{ type: 'text', text: typeof payload === 'string' ? payload : JSON.stringify(payload) }] });
-  const msgUri = (id) => 'mail:///messages/' + encodeURIComponent(id);
+  const msgUri = (id, owner) => 'mail:///messages/' + encodeURIComponent(id) + (owner ? '?owner=' + encodeURIComponent(owner) : '');
+  // Caixa de correio: a da pessoa (/me) ou uma caixa partilhada (/users/{caixa}, com Mail.Read.Shared / Mail.Send.Shared).
+  const box = (owner) => (owner ? '/users/' + encodeURIComponent(owner) : '/me');
+  const SHARED_READ = ['Mail.Read.Shared'], SHARED_SEND = ['Mail.Send.Shared'];
   const mapMsg = (m) => ({ id: m.id, uri: msgUri(m.id), subject: m.subject, sender: m.from ? { name: m.from.emailAddress.name, address: m.from.emailAddress.address } : m.sender ? { name: m.sender.emailAddress.name, address: m.sender.emailAddress.address } : null, receivedDateTime: m.receivedDateTime, createdDateTime: m.createdDateTime, lastModifiedDateTime: m.lastModifiedDateTime, hasAttachments: m.hasAttachments, webLink: m.webLink, isDraft: m.isDraft });
   const WELL_KNOWN = { drafts: 'drafts', rascunhos: 'drafts', inbox: 'inbox', 'caixa de entrada': 'inbox', 'sent items': 'sentitems', 'itens enviados': 'sentitems', 'deleted items': 'deleteditems', archive: 'archive' };
   const folderIds = {};
@@ -281,6 +292,14 @@
   const TOOLS = {
     async get_me() { const r = await graph('/me?$select=id,displayName,mail,userPrincipalName'); return result({ id: r.id, displayName: r.displayName, mail: r.mail, userPrincipalName: r.userPrincipalName }); },
     async outlook_email_search(a) {
+      if (a.mailboxOwnerEmail) {
+        // Caixa partilhada: pesquisa só pelo texto (como o conector do Claude).
+        const own = String(a.mailboxOwnerEmail).toLowerCase();
+        const q = String(a.query || '').replace(/"/g, '').replace(/^subject:/i, '').trim();
+        const top = Math.min(+a.limit || 10, 50);
+        const r = await graph(box(own) + '/messages?' + (q ? '$search=' + encodeURIComponent('"' + q + '"') + '&' : '$orderby=receivedDateTime desc&') + '$top=' + top + '&$select=id,subject,from,sender,receivedDateTime,createdDateTime,lastModifiedDateTime,hasAttachments,webLink,isDraft', { scopes: SHARED_READ });
+        return result((r.value || []).map((x) => Object.assign(mapMsg(x), { uri: msgUri(x.id, own), mailbox: own })));
+      }
       if (a.query && !a.folderName) {
         // Pesquisa em todas as pastas (ex.: "Relatório de preparação")
         // Aceita 'subject:"…"' (KQL) e afterDateTime (filtrado aqui: $search não combina com $filter).
@@ -299,14 +318,16 @@
       const m = String(a.uri || '').match(/^mail:\/\/\/messages\/([^/?]+)(?:\/attachments\/([^/?]+))?/);
       if (!m) { const e = new Error('Recurso não suportado: ' + a.uri); e.code = 'tool_error'; throw e; }
       const mid = decodeURIComponent(m[1]);
+      const ow = (String(a.uri).match(/[?&]owner=([^&]+)/) || [])[1]; const owner = ow ? decodeURIComponent(ow) : '';
+      const gopt = owner ? { scopes: SHARED_READ } : undefined;
       if (!m[2]) {
-        const msg = await graph('/me/messages/' + encodeURIComponent(mid) + '?$expand=attachments($select=id,name,contentType,size,isInline)');
+        const msg = await graph(box(owner) + '/messages/' + encodeURIComponent(mid) + '?$expand=attachments($select=id,name,contentType,size,isInline)', gopt);
         const o = mapMsg(msg);
         o.body = msg.body;
-        o.attachments = (msg.attachments || []).map((x) => ({ uri: msgUri(mid) + '/attachments/' + encodeURIComponent(x.id), name: x.name, contentType: x.contentType, size: x.size, isInline: x.isInline }));
+        o.attachments = (msg.attachments || []).map((x) => ({ uri: 'mail:///messages/' + encodeURIComponent(mid) + '/attachments/' + encodeURIComponent(x.id) + (owner ? '?owner=' + encodeURIComponent(owner) : ''), name: x.name, contentType: x.contentType, size: x.size, isInline: x.isInline }));
         return result(o);
       }
-      const att = await graph('/me/messages/' + encodeURIComponent(mid) + '/attachments/' + encodeURIComponent(decodeURIComponent(m[2])));
+      const att = await graph(box(owner) + '/messages/' + encodeURIComponent(mid) + '/attachments/' + encodeURIComponent(decodeURIComponent(m[2])), gopt);
       if (/\.xlsx$/i.test(att.name || '') && att.contentBytes) {
         const wb = new window.ExcelJS.Workbook(); await wb.xlsx.load(b64ToBytes(att.contentBytes).buffer);
         return result(sheetText(wb));
@@ -328,8 +349,21 @@
   };
   TOOLS.outlook_send_mail = async (a) => {
     const rcp = (l) => (l || []).map((x) => ({ emailAddress: { address: x } }));
-    await graph('/me/sendMail', { method: 'POST', body: { message: { subject: a.subject, body: { contentType: a.bodyType === 'html' ? 'HTML' : 'Text', content: a.body }, toRecipients: rcp(a.to), ccRecipients: rcp(a.cc), bccRecipients: rcp(a.bcc), attachments: (a.attachments || []).map((x) => ({ '@odata.type': '#microsoft.graph.fileAttachment', name: x.name, contentType: x.contentType || 'application/octet-stream', contentBytes: x.contentBytes })) }, saveToSentItems: true } });
-    return result({ sent: true });
+    const payload = { message: { subject: a.subject, body: { contentType: a.bodyType === 'html' ? 'HTML' : 'Text', content: a.body }, toRecipients: rcp(a.to), ccRecipients: rcp(a.cc), bccRecipients: rcp(a.bcc), attachments: (a.attachments || []).map((x) => ({ '@odata.type': '#microsoft.graph.fileAttachment', name: x.name, contentType: x.contentType || 'application/octet-stream', contentBytes: x.contentBytes })) }, saveToSentItems: true };
+    // Remetente: caixa partilhada (ex.: trueborn@) se a pessoa tiver "Enviar como" e o TI tiver dado Mail.Send.Shared;
+    // fica nos Itens Enviados da caixa partilhada. Senão envia da conta da pessoa e avisa a app.
+    const from = String(a.from || '').trim().toLowerCase();
+    if (from && from !== String(me.email || '').toLowerCase()) {
+      try { await graph(box(from) + '/sendMail', { method: 'POST', body: payload, scopes: SHARED_SEND }); return result({ sent: true, from }); }
+      catch (e) {
+        // Só sem permissão (401/403/404) ou sem consentimento (erro do token): outros erros não reenviam, para não duplicar.
+        if (e && e.status && ![401, 403, 404].includes(e.status)) throw e;
+        await graph('/me/sendMail', { method: 'POST', body: payload });
+        return result({ sent: true, from: me.email, fallback: 'sem permissão para enviar como ' + from + ' (' + ((e && (e.errorCode || e.message)) || 'erro') + ')' });
+      }
+    }
+    await graph('/me/sendMail', { method: 'POST', body: payload });
+    return result({ sent: true, from: me.email });
   };
   const mcp = {
     async callTool(server, tool, args) {
@@ -348,26 +382,29 @@
 
   async function start() {
     await pca.initialize();
-    const red = await pca.handleRedirectPromise().catch((e) => { gate(LOGO + '<p>Não foi possível entrar: ' + esc(e.message) + '</p><p><button id="sv-login">Tentar de novo</button></p>'); hookLogin(); return null; });
-    account = (red && red.account) || pca.getActiveAccount() || pca.getAllAccounts()[0] || null;
-    if (!account) {
-      gate(LOGO + '<p>Entre com a sua conta Microsoft <b>@' + esc(CFG.domain || 'montedopasto.pt') + '</b>.</p><p><button id="sv-login" style="font:600 15px Montserrat,Segoe UI,Arial,sans-serif;background:#247305;color:#fff;border:0;border-radius:8px;padding:12px 18px;cursor:pointer;width:100%">Entrar com a conta Microsoft</button></p><p style="font-size:13px;color:#5F5A51">Só entra quem tem conta da empresa e acesso à pasta SalesVision no SharePoint.</p>');
-      hookLogin(); return;
+    if (ROBOT) { me.email = String(ROBOT.mailbox).toLowerCase(); me.name = ROBOT.nome || 'Robô Encomendas'; me.id = me.email; }
+    else {
+      const red = await pca.handleRedirectPromise().catch((e) => { gate(LOGO + '<p>Não foi possível entrar: ' + esc(e.message) + '</p><p><button id="sv-login">Tentar de novo</button></p>'); hookLogin(); return null; });
+      account = (red && red.account) || pca.getActiveAccount() || pca.getAllAccounts()[0] || null;
+      if (!account) {
+        gate(LOGO + '<p>Entre com a sua conta Microsoft <b>@' + esc(CFG.domain || 'montedopasto.pt') + '</b>.</p><p><button id="sv-login" style="font:600 15px Montserrat,Segoe UI,Arial,sans-serif;background:#247305;color:#fff;border:0;border-radius:8px;padding:12px 18px;cursor:pointer;width:100%">Entrar com a conta Microsoft</button></p><p style="font-size:13px;color:#5F5A51">Só entra quem tem conta da empresa e acesso à pasta SalesVision no SharePoint.</p>');
+        hookLogin(); return;
+      }
+      pca.setActiveAccount(account);
+      const email = String(account.username || '').toLowerCase();
+      if (CFG.domain && !email.endsWith('@' + CFG.domain.toLowerCase())) {
+        gate(LOGO + '<p>A conta <b>' + esc(email) + '</b> não é da empresa. Entre com a conta @' + esc(CFG.domain) + '.</p><p><button id="sv-logout">Sair</button></p>'); hookLogout(); return;
+      }
+      me.email = email; me.name = account.name || email; me.id = email;
     }
-    pca.setActiveAccount(account);
-    const email = String(account.username || '').toLowerCase();
-    if (CFG.domain && !email.endsWith('@' + CFG.domain.toLowerCase())) {
-      gate(LOGO + '<p>A conta <b>' + esc(email) + '</b> não é da empresa. Entre com a conta @' + esc(CFG.domain) + '.</p><p><button id="sv-logout">Sair</button></p>'); hookLogout(); return;
-    }
-    me.email = email; me.name = account.name || email; me.id = email;
     try { await graph('/drives/' + encodeURIComponent(DRIVE) + '/items/' + encodeURIComponent(ROOT) + '?$select=id,name'); }
     catch (e) {
-      gate(LOGO + '<p><b>Sem acesso à pasta de dados.</b></p><p>A conta ' + esc(email) + ' não tem acesso à pasta SalesVision no SharePoint (' + esc(e.message) + '). Peça acesso ao administrador.</p><p><button id="sv-logout">Sair</button></p>'); hookLogout(); return;
+      gate(LOGO + '<p><b>Sem acesso à pasta de dados.</b></p><p>A conta ' + esc(me.email) + ' não tem acesso à pasta SalesVision no SharePoint (' + esc(e.message) + '). Peça acesso ao administrador.</p><p><button id="sv-logout">Sair</button></p>'); hookLogout(); return;
     }
     // Perfil (nome) para o histórico das encomendas.
     writeDoc('users/' + me.id.replace(/[^A-Za-z0-9_\-.~:@+]/g, '_'), { name: me.name, email: me.email, lastSeen: new Date().toISOString() }).catch(() => {});
     ungate();
-    addUserChip();
+    if (!ROBOT) addUserChip();
     resolveReady();
   }
   function hookLogin() { const b = document.getElementById('sv-login'); if (b) b.onclick = () => pca.loginRedirect({ scopes: SCOPES, prompt: 'select_account' }); }
