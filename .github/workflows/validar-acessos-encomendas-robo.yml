@@ -51,7 +51,37 @@ jobs:
               await result.body?.cancel();
               return result.status === expected;
             }));
-            return results.every(Boolean);
+            if (!results.every(Boolean)) return false;
+
+            const name = 'teste-acesso-encomendas-' + crypto.randomUUID() + '.txt';
+            const marker = 'Validação de escrita do Encomendas Robô: ' + name;
+            const root = graph + '/v1.0/drives/' + drive + '/items/';
+            const headers = { Authorization: 'Bearer ' + token };
+            console.log('Ficheiro temporário: ' + name);
+            const upload = await fetch(root + folder + ':/' + name + ':/content', {
+              method: 'PUT',
+              headers: { ...headers, 'Content-Type': 'text/plain' },
+              body: marker,
+              signal: AbortSignal.timeout(15000),
+            });
+            console.log('Criação no SharePoint: HTTP ' + upload.status + ' (esperado 201)');
+            if (upload.status !== 201) return false;
+
+            const { id } = await upload.json();
+            if (!id) throw new Error('Criação sem identificador');
+            const item = root + encodeURIComponent(id);
+            let matched = false;
+            let removed = false;
+            try {
+              const read = await fetch(item + '/content', { headers, signal: AbortSignal.timeout(15000) });
+              matched = read.ok && (await read.text()) === marker;
+              console.log('Leitura do conteúdo gravado: ' + (matched ? 'confirmada' : 'falhou'));
+            } finally {
+              const cleanup = await fetch(item, { method: 'DELETE', headers, signal: AbortSignal.timeout(15000) });
+              removed = cleanup.status === 204;
+              console.log('Remoção do ficheiro temporário: HTTP ' + cleanup.status + ' (esperado 204)');
+            }
+            return matched && removed;
           }
 
           main().then((ok) => { process.exitCode = ok ? 0 : 1; }).catch(() => {
