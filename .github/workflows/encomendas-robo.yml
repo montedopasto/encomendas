@@ -3,7 +3,7 @@ name: Encomendas Robô
 on:
   workflow_dispatch:
   schedule:
-    - cron: '2-57/5 * * * *'
+    - cron: '7 6-21 * * *' # De hora a hora, das 06h às 21h UTC.
 
 permissions:
   contents: read
