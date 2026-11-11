@@ -1,7 +1,14 @@
 name: Encomendas Robô
 
+run-name: ${{ inputs.slot && format('Encomendas Robô UTC {0}', inputs.slot) || 'Encomendas Robô' }}
+
 on:
   workflow_dispatch:
+    inputs:
+      slot:
+        description: 'Hora UTC indicada pelo agendador externo (yyyy-MM-ddTHH)'
+        required: false
+        type: string
   schedule:
     - cron: '7 6-21 * * *' # De hora a hora, das 06h às 21h UTC.
 
@@ -14,7 +21,7 @@ concurrency:
 
 jobs:
   validar:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.slot == ''
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -27,7 +34,10 @@ jobs:
           test -s public/config.js
 
   executar:
-    if: github.event_name == 'schedule' && vars.ENCOMENDAS_ROBO_ATIVO == 'true'
+    if: >-
+      vars.ENCOMENDAS_ROBO_ATIVO == 'true' &&
+      ((github.event_name == 'schedule' && vars.ENCOMENDAS_ROBO_EXTERNO != 'true') ||
+       (github.event_name == 'workflow_dispatch' && inputs.slot != '' && vars.ENCOMENDAS_ROBO_EXTERNO == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     container:
