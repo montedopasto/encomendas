@@ -2,6 +2,7 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const publicDir = path.resolve(__dirname, '../public');
 const site = 'https://encomendas.montedopasto.pt';
@@ -43,6 +44,41 @@ async function run() {
     return cachedToken.value;
   }
 
+  let app;
+  try {
+    const config = { window: {} };
+    vm.runInNewContext(await fs.readFile(path.join(publicDir, 'config.js'), 'utf8'), config, { timeout: 1000 });
+    const { dataDriveId, dataFolderId } = config.window.ENCOMENDAS_CONFIG;
+    const drive = '/v1.0/drives/' + encodeURIComponent(dataDriveId) + '/items/';
+    async function readGraph(resource, stage) {
+      const response = await fetch(graphOrigin + resource, {
+        headers: { Authorization: 'Bearer ' + await token() },
+        signal: AbortSignal.timeout(15000),
+      }).catch(() => null);
+      if (!response?.ok) throw new Error(stage + ' · ' + (response ? 'HTTP ' + response.status : 'sem resposta'));
+      return response;
+    }
+    const data = await (await readGraph(drive + encodeURIComponent(dataFolderId) + '?$select=parentReference', 'localizar dados')).json();
+    if (!data.parentReference?.id) throw new Error('pasta pai não encontrada');
+    const parent = drive + encodeURIComponent(data.parentReference.id);
+    const folder = await (await readGraph(parent + ':/app:/children?$select=id,name,lastModifiedDateTime&$top=100', 'listar app')).json();
+    const index = folder.value?.find(item => item.name.toLowerCase() === 'index.html');
+    const platform = folder.value?.find(item => item.name.toLowerCase() === 'platform.js');
+    if (!index || !platform) throw new Error('index.html ou platform.js em falta');
+    const [html, js] = await Promise.all([
+      readGraph(drive + encodeURIComponent(index.id) + '/content', 'ler index.html').then(r => r.text()),
+      readGraph(drive + encodeURIComponent(platform.id) + '/content', 'ler platform.js').then(r => r.text()),
+    ]);
+    if (!html.includes('__svEstado') || !js.trim()) throw new Error('ficheiros da app incompletos');
+    app = { html, js };
+    const version = new Date(index.lastModifiedDateTime);
+    console.log('App: SharePoint (' + (Number.isNaN(version.valueOf()) ? 'data indisponível' : version.toISOString()) + ')');
+  } catch (error) {
+    const safe = /^(localizar dados|listar app|ler index\.html|ler platform\.js) · (HTTP \d{3}|sem resposta)$|^(pasta pai não encontrada|index\.html ou platform\.js em falta|ficheiros da app incompletos)$/;
+    console.error('Pasta app do SharePoint indisponível (' + (safe.test(error.message) ? error.message : 'erro de leitura ou configuração') + ').');
+    throw new Error('Ciclo interrompido para evitar usar uma versão antiga da app.');
+  }
+
   const browser = await chromium.launch();
   try {
     const page = await browser.newPage();
@@ -51,7 +87,13 @@ async function run() {
 
     await page.route(site + '/**', async (route) => {
       const url = new URL(route.request().url());
-      const requestedPath = url.pathname === '/' ? '/app.html' : url.pathname;
+      if (['/', '/index.html', '/app.html'].includes(url.pathname)) {
+        return route.fulfill({ body: app.html, contentType: mime['.html'] });
+      }
+      if (url.pathname === '/platform.js') {
+        return route.fulfill({ body: app.js, contentType: mime['.js'] });
+      }
+      const requestedPath = url.pathname;
       const file = path.resolve(publicDir, '.' + requestedPath);
       if (!file.startsWith(publicDir + path.sep)) return route.abort();
       let body;
@@ -97,6 +139,7 @@ async function run() {
 
 run().catch((error) => {
   const safeMessages = new Set([
+    'Ciclo interrompido para evitar usar uma versão antiga da app.',
     'Credenciais do robô por configurar.',
     'Falha na autenticação do robô.',
     'A aplicação reportou um erro.',
