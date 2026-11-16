@@ -65,6 +65,10 @@ async function run() {
     });
 
     await page.exposeFunction('__svRobotToken', token);
+    if (process.env.GEMINI_API_KEY) {
+      const { criarLeitor } = require('./ler-guia');
+      await page.exposeFunction('__svLerGuia', criarLeitor(process.env.GEMINI_API_KEY));
+    }
     await page.addInitScript((address) => {
       window.__svRobot = { mailbox: address, nome: 'Robô Encomendas' };
     }, mailbox);
