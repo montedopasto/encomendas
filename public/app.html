@@ -2545,12 +2545,46 @@ function guiaConfirmadaParaFinanceiro(o) {
   return !!(guia?.by && guia.at && guia.ficheiros?.length &&
     (guia.estado === 'ok' || (guia.estado === 'problema' && ['parcial', 'tudo'].includes(guia.decisao))));
 }
+function quantidadesParaFaturar(preps, cmp, guia) {
+  if (guia.decisao !== 'parcial') return { preps, cmp };
+  if (!Array.isArray(guia.linhas) || !guia.linhas.length) throw new Error('Indique as quantidades a descontar.');
+  const preparados = Z.latestPreps(preps).map(p => ({ ...p, lines: (p.lines || []).map(l => ({ ...l })) }));
+  const linhas = preparados.flatMap(p => p.lines);
+  const usados = new Set();
+  for (const d of guia.linhas) {
+    const matches = linhas.filter(l => l.article === d.article && (l.lot || '') === (d.lot || ''));
+    const l = matches[0];
+    if (matches.length !== 1 || usados.has(l)) throw new Error('A divergência não identifica uma única linha de preparação.');
+    const cx = d.cxNF || 0, kg = d.kgNF || 0;
+    if (!Number.isInteger(cx) || cx < 0 || cx > l.cases ||
+        !Number.isFinite(kg) || kg < 0 || kg > l.weight || (!cx && !kg)) {
+      throw new Error('A quantidade a descontar ultrapassa a preparação ou é inválida.');
+    }
+    usados.add(l);
+    const caixasAntes = l.cases;
+    l.cases -= cx;
+    l.weight = Z.round3(l.weight - kg);
+    if (cx && Number.isFinite(l.pieces)) {
+      const aceites = l.pieces * l.cases / caixasAntes;
+      if (!Number.isInteger(aceites)) throw new Error('Não foi possível determinar as peças aceites.');
+      l.pieces = aceites;
+    }
+  }
+  return { preps: preparados, cmp: {
+    ...cmp,
+    totalCx: linhas.reduce((t, l) => t + l.cases, 0),
+    totalKg: Z.round3(linhas.reduce((t, l) => t + l.weight, 0)),
+  } };
+}
 async function sendFinance(o, auto) {
   if (!guiaConfirmadaParaFinanceiro(o)) return auto ? null : toast('Confirme a guia antes de enviar ao Financeiro.');
   const preps = prepsOf(o); const cmp = Z.comparePreparation(o, preps);
   if (!(o.prep && (o.prep.status === 'ok' || o.prep.status === 'corrigida'))) return auto ? null : toast('A preparação ainda tem divergências por resolver.');
-  const em = Z.financeEmail(o, preps, cmp, S.cfg, S.precos);
   const guia = o.prep.guia;
+  let faturar;
+  try { faturar = quantidadesParaFaturar(preps, cmp, guia); }
+  catch (e) { return auto ? null : toast(e.message); }
+  const em = Z.financeEmail(o, faturar.preps, faturar.cmp, S.cfg, S.precos);
   if (guia.estado === 'problema') {
     em.html = '<p><b>Divergência confirmada na guia. Decisão: ' + h(GUIA_DECISAO[guia.decisao].curto) + '</b></p>' +
       '<p>' + h(guia.notas || '') + '</p><ul>' + (guia.linhas || []).map(l =>
@@ -2564,21 +2598,21 @@ async function sendFinance(o, auto) {
     try { const fresh = (await store.getOrders()).find((x) => x.id === o.id); if (fresh && fresh.prep && fresh.prep.financeiro) { o.prep.financeiro = fresh.prep.financeiro; return null; } } catch (e) { return null; }
     try {
       await sendMail({ to, cc: me.ok ? [me.email] : [], subject: em.subject, body: em.html, bodyType: 'html' });
-      o.prep.financeiro = { at: new Date().toISOString(), by: S.me.id, para: to, totalCx: cmp.totalCx, totalKg: cmp.totalKg, auto: true };
+      o.prep.financeiro = { at: new Date().toISOString(), by: S.me.id, para: to, totalCx: faturar.cmp.totalCx, totalKg: faturar.cmp.totalKg, auto: true };
       delete o.prep.financeiroErro;
-      Z.addHistory(o, S.me.id, 'Dados enviados ao Financeiro (automático)', to.join(', ') + ' · ' + cmp.totalCx + ' cx · ' + String(cmp.totalKg).replace('.', ',') + ' kg · a preparação confere');
+      Z.addHistory(o, S.me.id, 'Dados enviados ao Financeiro (automático)', to.join(', ') + ' · ' + faturar.cmp.totalCx + ' cx · ' + String(faturar.cmp.totalKg).replace('.', ',') + ' kg · a preparação confere');
       await persistOrder(o);
       if (o.prep.guia.estado === 'ok' && S.cfg.notaClienteAuto !== false) await sendClientNote(o, true);
       return true;
     } catch (e) { o.prep.financeiroErro = { at: new Date().toISOString(), msg: MS_ERR(e, 'enviar o email') }; await persistOrder(o); return false; }
   }
-  if (!confirm('Enviar ao Financeiro (' + to.join(', ') + ') os dados para faturar a encomenda ' + o.ref + '?\n\n' + cmp.totalCx + ' caixas · ' + String(cmp.totalKg).replace('.', ',') + ' kg')) return;
+  if (!confirm('Enviar ao Financeiro (' + to.join(', ') + ') os dados para faturar a encomenda ' + o.ref + '?\n\n' + faturar.cmp.totalCx + ' caixas · ' + String(faturar.cmp.totalKg).replace('.', ',') + ' kg')) return;
   S.ui.busy = true; render();
   try {
     await sendMail({ to, cc: me.ok ? [me.email] : [], subject: em.subject, body: em.html, bodyType: 'html' });
-    o.prep.financeiro = { at: new Date().toISOString(), by: S.me.id, para: to, totalCx: cmp.totalCx, totalKg: cmp.totalKg };
+    o.prep.financeiro = { at: new Date().toISOString(), by: S.me.id, para: to, totalCx: faturar.cmp.totalCx, totalKg: faturar.cmp.totalKg };
     delete o.prep.financeiroErro;
-    Z.addHistory(o, S.me.id, 'Dados enviados ao Financeiro', to.join(', ') + ' · ' + cmp.totalCx + ' cx · ' + String(cmp.totalKg).replace('.', ',') + ' kg');
+    Z.addHistory(o, S.me.id, 'Dados enviados ao Financeiro', to.join(', ') + ' · ' + faturar.cmp.totalCx + ' cx · ' + String(faturar.cmp.totalKg).replace('.', ',') + ' kg');
     await persistOrder(o);
     let nota = null; if (o.prep.guia.estado === 'ok' && S.cfg.notaClienteAuto !== false && !o.prep.notaCliente) nota = await sendClientNote(o, true);
     toast('Enviado ao Financeiro.' + (nota === true ? ' Nota de encomenda enviada ao cliente.' : nota === 'pendente' ? ' A nota ao cliente tem dúvidas nos preços: ficou à espera de aprovação.' : nota === false ? ' A nota ao cliente não foi enviada (ver a encomenda).' : ''));
