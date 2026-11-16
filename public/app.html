@@ -1701,8 +1701,40 @@ pre.mail { white-space: pre-wrap; font: 14px/1.5 var(--f-body); background: var(
     return { subject, body };
   }
 
+  const SCAN_SUBJECT = /zolve\s*scans/i;
+  /** Linhas do email "Zolve Scans": uma por guia digitalizada — ficheiro, data, destino e referência do pedido (colados). */
+  function parseScanBody(body) {
+    const html = String((body && (body.content || body)) || '');
+    const txt = html.replace(/<\/(div|p|tr|li)>/gi, '\n').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
+    const out = [];
+    txt.split(/\r?\n/).forEach((l) => {
+      const m = l.trim().match(/^(AL_[\w-]+\.pdf)\s*(\d{4}-\d{2}-\d{2})\s*(.+)$/i);
+      if (m) out.push({ ficheiro: m[1], data: m[2], resto: m[3].trim(), devolucao: /DEV\s*-\s/i.test(m[3]) });
+    });
+    return out;
+  }
+  /** Relatório de preparação de uma guia: a referência do pedido (ex.: AFF_0511) está no fim da linha do email. */
+  function matchScanPrep(scan, preps) {
+    const r = lgNorm(scan.resto);
+    let cand = (preps || []).filter((p) => { const z = lgNorm(p.zolveRef); return z.length >= 4 && (r.endsWith(z) || r.includes(z)); });
+    // A guia pode vir sem o sufixo do pedido (preparação "Sogenave_Maia_0411_1", guia "Sogenave_Maia_0411").
+    if (!cand.length) cand = (preps || []).filter((p) => { const z = lgNorm(String(p.zolveRef || '').replace(/[_-]\d{1,2}$/, '')); return z.length >= 6 && r.endsWith(z); });
+    if (!cand.length) return null;
+    const dd = (p) => Math.abs(Date.parse(scan.data) - Date.parse(p.date || scan.data)) / 86400000;
+    cand.sort((a, b) => (lgNorm(b.zolveRef).length - lgNorm(a.zolveRef).length) || (r.endsWith(lgNorm(b.zolveRef)) - r.endsWith(lgNorm(a.zolveRef))) || (dd(a) - dd(b)));
+    return cand[0];
+  }
+  /* Email à Logifrio a pedir a correção da preparação. */
+  function correctionEmail(order, cmp, cfg) {
+    const subject = 'Correção da preparação - ' + cmp.refs.join(', ') + ' - ' + String(order.cliente || '').trim();
+    const body = [salutation(cfg), '', 'A preparação ' + cmp.refs.join(', ') + ' não confere com o pedido de saída de stock ' + order.ref + ' (' + order.cliente + ', entrega a ' + fmtDate(order.dataEntrega) + '):', '',
+      ...cmp.errors.map((e) => '- ' + e), '', 'Agradecemos que corrijam a preparação e nos enviem o relatório atualizado.', '', 'Com os melhores cumprimentos,', cfgForOrder(order, cfg).contacto, cfg.empresa].join('\n');
+    return { subject, body };
+  }
+
   return {
     ACTIVE_STATES, STATE_LABEL, DEFAULT_CONFIG, TRANSITIONS,
+    SCAN_SUBJECT, parseScanBody, matchScanPrep,
     PREP_SUBJECT, prepInfoFromSubject, prepDestinatario, parsePickingText, nameSimilarity, prepMatchScore, matchPreparation, latestPreps, comparePreparation, financeEmail, clientNoteEmail, clientNoteRecipients, noteDoubts, parseLogifrioInvoice, matchLogifrioInvoice, learnLogifrioTariffs, logifrioTariffFor, lgCp, lgNorm, correctionEmail, htmlToText,
     isoToday, addDays, fmtDate, isIso, gs1CheckOk, lineKey, uid, round3,
     parseStockWorkbook, parseStockRows, mailItems, resultText, pickDailyReport, pickDailyReports, reportTags, mergeParsed, reportAttachment, stockRowsFromText, parseStockText, eligibility, reservedMap, stockView, suggest, suggestKg, makeAlloc, withEstimate, perBoxKg, lineKg, fmtKg, allocWeight, articleTaken,
@@ -1758,6 +1790,8 @@ function MemStore() {
     async saveClientPrices(d) { mem.precos = clone(d); (subs.pre || []).forEach((f) => f(clone(d))); },
     onClientExtras(f) { subs.cx = subs.cx || []; subs.cx.push(f); f(mem.cx || null); },
     async saveClientExtras(list) { mem.cx = { items: clone(list) }; (subs.cx || []).forEach((f) => f(clone(mem.cx))); },
+    onGuias(f) { subs.gu = subs.gu || []; subs.gu.push(f); f(Object.values(mem.guias || {}).map(clone)); },
+    async saveGuia(x) { mem.guias = mem.guias || {}; mem.guias[x.id] = clone(x); (subs.gu || []).forEach((f) => f(Object.values(mem.guias).map(clone))); },
     onPreps(f) { subs.pr = subs.pr || []; subs.pr.push(f); f(Object.values(mem.preps || {}).map(clone)); },
     async savePrep(p) { mem.preps = mem.preps || {}; mem.preps[p.id] = clone(p); (subs.pr || []).forEach((f) => f(Object.values(mem.preps).map(clone))); },
     async deleteOrder(id) { delete mem.orders[id]; emit('orders', Object.values(mem.orders).map(clone)); },
@@ -1828,6 +1862,8 @@ function DbStore(db) {
     saveClientPrices(d) { return serial('pre', () => db.doc('clientes/precos').set(clone(d))); },
     onClientExtras(f) { db.doc('clientes/extra').onSnapshot((s) => f(s.exists ? s.data() : null), onDbErr); },
     saveClientExtras(list) { return serial('cx', () => db.doc('clientes/extra').set({ items: clone(list), updatedAt: new Date().toISOString() })); },
+    onGuias(f) { db.collection('guias').onSnapshot((s) => f(s.docs.map((d) => d.data())), onDbErr); },
+    saveGuia(x) { const body = clone(x); return serial('g/' + x.id, () => db.collection('guias').doc(x.id).set(body)); },
     onPreps(f) { db.collection('preparacoes').onSnapshot((s) => f(s.docs.map((d) => d.data())), onDbErr); },
     savePrep(p) { const body = clone(p); return serial('p/' + p.id, () => db.collection('preparacoes').doc(p.id).set(body)); },
     deleteOrder(id) { return serial('o/' + id, () => db.collection('orders').doc(id).delete()); },
@@ -1879,6 +1915,7 @@ async function boot() {
   store.onClients((d) => { S.clientsList = d ? d.items || [] : []; S.clients = { items: [], meta: d || null }; mergeCli(); render(); });
   store.onClientExtras((d) => { S.clientExtras = d && d.items ? d.items : []; mergeCli(); render(); });
   S.preps = [];
+  store.onGuias((list) => { S.guias = list || []; render(); });
   store.onPreps((list) => { S.preps = list || []; render(); });
   S.faltas = []; S.catalog = {};
   if (store.onFaltas) store.onFaltas((list) => { S.faltas = list || []; if (S.view === 'faltas' || S.view === 'order') render(); });
@@ -2194,6 +2231,7 @@ async function checkPreparations(auto) {
       } catch (e) { erros.push(t.info.zolveRef + ': ' + ((e && e.message) || e)); }
     }
     assoc = await autoLinkPreps();
+    try { await checkGuias(); await lerGuiasIA(); } catch (e) { erros.push('Guias: ' + e.message); }
     let fin = 0, finErr = 0;
     for (const o of S.orders) if (o.prep && prepsOf(o).length) {
       const oo = getOrder(o.id); await recomputePrep(oo, true);
@@ -2266,10 +2304,258 @@ async function sendMail(args) {
   if (p.fallback && !avisoRemetente) { avisoRemetente = true; setTimeout(() => toast('O email saiu da sua conta, não de ' + r + ': ' + p.fallback + '. Peça ao TI a permissão "Enviar como".'), 1200); }
   return p;
 }
+const guiasOf = (o) => { const ids = new Set(prepsOf(o).map((p) => p.id)); return (S.guias || []).filter((g) => g.prepId && ids.has(g.prepId)); };
+function guiaPendente(o) { return !!(o && o.prep && ['ok', 'corrigida'].includes(o.prep.status) && !o.prep.guia && !o.prep.financeiro && o.state !== 'cancelada' && guiasOf(o).length); }
+async function checkGuias() {
+  if (!S.caps.mcp || !store.saveGuia) return 0;
+  const desde = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const all = [];
+  try { all.push(...Z.mailItems(await S.caps.mcp.callTool('Microsoft 365', 'outlook_email_search', { query: 'subject:"Zolve Scans"', afterDateTime: desde, limit: 25 }, { cache: false }))); }
+  catch (e) { try { all.push(...Z.mailItems(await S.caps.mcp.callTool('Microsoft 365', 'outlook_email_search', { query: '"Zolve Scans"', limit: 25 }, { cache: false }))); } catch (e2) { /* sem acesso ao email */ } }
+  const cx = remetente();
+  if (cx && cx !== String(identity().email || '').toLowerCase()) { try { all.push(...Z.mailItems(await S.caps.mcp.callTool('Microsoft 365', 'outlook_email_search', { query: 'Zolve Scans', mailboxOwnerEmail: cx, limit: 25 }, { cache: false }))); } catch (e) { /* caixa partilhada sem acesso */ } }
+  const msgs = all.filter((m) => Z.SCAN_SUBJECT.test(m.subject || '') && !(m.receivedDateTime && m.receivedDateTime.slice(0, 10) < desde));
+  let n = 0; const vistos = new Set((S.guias || []).map((g) => g.msgKey));
+  for (const m of msgs.slice(0, 15)) {
+    const key = (m.subject || '') + '|' + (m.receivedDateTime || m.id || ''); // igual na caixa da pessoa e na partilhada
+    if (vistos.has(key)) continue; vistos.add(key);
+    const uri = m.uri || ('mail:///messages/' + encodeURIComponent(m.id || ''));
+    const mr = await S.caps.mcp.callTool('Microsoft 365', 'read_resource', { uri }, { cache: false });
+    const msg = Z.mailItems(mr)[0] || (mr && mr.payload) || {};
+    const linhas = Z.parseScanBody(msg.body);
+    const docs = linhas.length ? linhas : [{ ficheiro: '', data: '', resto: '', vazio: true }];
+    for (const l of docs) {
+      const att = l.ficheiro ? (msg.attachments || []).find((a) => String(a.name || '').toLowerCase() === l.ficheiro.toLowerCase()) : null;
+      const id = l.ficheiro ? l.ficheiro.replace(/\.pdf$/i, '').replace(/[^A-Za-z0-9_-]/g, '_') : 'msg_' + String(m.receivedDateTime || Date.now()).replace(/\D/g, '');
+      const old = (S.guias || []).find((g) => g.id === id);
+      const doc = Object.assign({}, old || {}, l, { id, msgKey: key, msgUri: uri, attUri: att ? att.uri : '', webLink: m.webLink || msg.webLink || '', receivedAt: m.receivedDateTime || '' });
+      if (!doc.vazio && !doc.prepId) { const p = Z.matchScanPrep(doc, S.preps); if (p) doc.prepId = p.id; }
+      await store.saveGuia(doc); n++;
+      const i = (S.guias || []).findIndex((g) => g.id === id); if (i >= 0) S.guias[i] = doc; else (S.guias = S.guias || []).push(doc);
+    }
+  }
+  // Guias que chegaram antes do relatório de preparação: tenta outra vez.
+  for (const g of (S.guias || []).filter((x) => !x.prepId && !x.vazio)) { const p = Z.matchScanPrep(g, S.preps); if (p) { g.prepId = p.id; try { await store.saveGuia(g); } catch (e) {} } }
+  return n;
+}
+/* ---------- Leitura automática das guias (IA de visão gratuita, pelo robô: GitHub Models ou Gemini) ----------
+   Só corre no robô com a chave da API (window.__svLerGuia). Lê assinatura e anotações à mão de cada guia nova e
+   guarda a leitura na guia; a app mostra-a e preenche a divergência, mas é sempre uma pessoa que confirma. */
+const guiaLida = (o) => guiasOf(o).find((g) => g.leitura && !g.leitura.erro) || null;
+const guiaLidaProblema = (o) => { const g = guiaLida(o); return !!(g && (g.leitura.problema || g.leitura.assinada === false)); };
+async function guiaImagens(g, max) {
+  const r = await S.caps.mcp.callTool('Microsoft 365', 'read_resource', { uri: g.attUri }, { cache: false });
+  let b64 = r && r.payload && r.payload.contentBytes;
+  if (!b64) { try { b64 = JSON.parse(Z.resultText(r)).contentBytes; } catch (e) { b64 = null; } }
+  if (!b64) throw new Error('sem o PDF da guia');
+  const lib = await loadPdfJs();
+  const doc = await lib.getDocument({ data: Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)) }).promise;
+  const out = [];
+  for (let i = 1; i <= Math.min(doc.numPages, max || 3); i++) {
+    const pg = await doc.getPage(i); const v0 = pg.getViewport({ scale: 1 }); const sc = Math.min(2.2, 1800 / Math.max(v0.width, v0.height));
+    const vp = pg.getViewport({ scale: sc }); const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
+    const cx = cv.getContext('2d'); cx.fillStyle = '#fff'; cx.fillRect(0, 0, cv.width, cv.height);
+    await pg.render({ canvasContext: cx, viewport: vp }).promise;
+    out.push(cv.toDataURL('image/jpeg', 0.85));
+  }
+  return out;
+}
+function guiaPedidoIA(g, prep, o) {
+  const linhas = prep ? (prep.lines || []).map((l) => '- ' + l.article + ' | ' + (l.name || '') + ' | lote ' + (l.lot || '—') + ' | ' + (l.cases || 0) + ' cx | ' + Z.round3(l.weight || 0) + ' kg').join('\n') : '(sem relatório de preparação associado)';
+  return 'És um assistente de logística da Monte do Pasto (carne). As imagens são a guia de entrega (documento de transporte da Logifrio/Zolve) ' + g.ficheiro +
+    ', digitalizada depois da entrega' + (o ? ' ao cliente ' + (o.cliente || '') : '') + '. O texto impresso é a própria guia. Interessa-nos o que foi ESCRITO À MÃO ou CARIMBADO por cima.\n\n' +
+    'Artigos que a Logifrio preparou para esta entrega:\n' + linhas + '\n\n' +
+    'Diz-me:\n1. Se a guia está assinada pelo cliente (assinatura, rubrica ou carimbo de receção).\n2. Toda a escrita à mão/carimbos, transcrita tal como está (inclui nomes, datas, horas, temperaturas, matrículas).\n' +
+    '3. Se alguma anotação indica um PROBLEMA na entrega: produto recusado, devolvido, em falta, danificado, mau estado/qualidade, temperatura fora, validade, quantidade diferente, artigo trocado. Nome, data, hora, matrícula ou temperatura normal NÃO são problema.\n' +
+    '4. Para cada problema, o artigo (código da lista acima, se der para perceber), o lote, a quantidade afetada (caixas e/ou kg, só se estiver escrita) e o motivo, escolhido desta lista: ' + GUIA_MOTIVOS.join('; ') + '.\n\n' +
+    'Responde APENAS com JSON, sem mais texto, neste formato:\n{"legivel": true, "assinada": true, "problema": false, "transcricao": "texto manuscrito", "divergencias": [{"artigo": "TBB028", "lote": "", "caixas": 1, "kg": null, "motivo": "Devolvido / recusado pelo cliente", "texto": "o que está escrito sobre isto"}], "observacoes": "dúvidas sobre a leitura, se houver"}\n' +
+    'Se não tiveres a certeza de um valor, deixa-o null e explica em "observacoes". Não inventes quantidades.';
+}
+async function lerGuiasIA() {
+  if (typeof window.__svLerGuia !== 'function' || !S.caps.mcp || !store.saveGuia) return 0;
+  const desde = Date.now() - 15 * 86400000;
+  const cand = (S.guias || []).filter((g) => g.attUri && !g.vazio && (!g.leitura || (g.leitura.erro && (g.leitura.tentativas || 0) < 3)) && Date.parse(g.receivedAt || 0) > desde)
+    .sort((a, b) => String(b.receivedAt || '').localeCompare(String(a.receivedAt || ''))).slice(0, 4);
+  let n = 0;
+  for (const g of cand) {
+    const prep = g.prepId ? (S.preps || []).find((p) => p.id === g.prepId) : null; const o = prep && prep.orderId ? getOrder(prep.orderId) : null;
+    try {
+      const imgs = await guiaImagens(g, 3);
+      const r = await window.__svLerGuia({ imagens: imgs, pedido: guiaPedidoIA(g, prep, o), guia: g.ficheiro });
+      if (r && r.limite) break; // limite gratuito do dia: tenta na próxima execução, sem contar como falha
+      const txt = String((r && r.texto) || ''); const j = JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
+      const div = (Array.isArray(j.divergencias) ? j.divergencias : []).map((d) => ({ artigo: String(d.artigo || '').trim().toUpperCase(), lote: String(d.lote || '').trim(), caixas: isFinite(+d.caixas) && d.caixas !== null && d.caixas !== '' ? +d.caixas : null, kg: isFinite(+d.kg) && d.kg !== null && d.kg !== '' ? +d.kg : null, motivo: GUIA_MOTIVOS.includes(d.motivo) ? d.motivo : 'Outro', texto: String(d.texto || '') }));
+      g.leitura = { at: new Date().toISOString(), modelo: (r && r.modelo) || '', legivel: j.legivel !== false, assinada: j.assinada === true ? true : j.assinada === false ? false : null, problema: !!j.problema || div.length > 0, transcricao: String(j.transcricao || '').slice(0, 2000), divergencias: div, observacoes: String(j.observacoes || '').slice(0, 1000) };
+      n++;
+      if (o) Z.addHistory(o, S.me.id, 'Guia lida automaticamente', g.ficheiro + ' · ' + (g.leitura.assinada === false ? 'sem assinatura · ' : '') + (g.leitura.problema ? 'com anotações: ' + (g.leitura.transcricao || '').slice(0, 200) : 'sem anotações de problemas'));
+      if (o) { try { await persistOrder(o); } catch (e) {} }
+    } catch (e) {
+      g.leitura = { erro: String((e && e.message) || e).slice(0, 300), at: new Date().toISOString(), tentativas: ((g.leitura && g.leitura.tentativas) || 0) + 1 };
+    }
+    try { await store.saveGuia(g); } catch (e) {}
+  }
+  return n;
+}
+function guiaLeituraHtml(o) {
+  const gs = guiasOf(o).filter((g) => g.leitura && !g.leitura.erro); if (!gs.length) return '';
+  return gs.map((g) => { const L = g.leitura; const mau = L.problema || L.assinada === false;
+    return '<div class="note ' + (mau ? 'warn' : 'ok') + '"><b>Leitura automática da guia ' + h(g.ficheiro) + '</b> <span class="muted">(' + h(fmtDT(L.at)) + ')</span>: ' +
+      (L.assinada === true ? 'assinada' : L.assinada === false ? '<b>sem assinatura</b>' : 'assinatura por confirmar') + ' · ' + (L.problema ? '<b>com anotações de problemas</b>' : 'sem anotações de problemas') + (L.legivel === false ? ' · <b>pouco legível</b>' : '') +
+      (L.transcricao ? '<div style="margin-top:4px">Escrito à mão: <i>' + h(L.transcricao) + '</i></div>' : '') +
+      ((L.divergencias || []).length ? '<ul style="margin:4px 0 0">' + L.divergencias.map((d) => '<li><b class="mono">' + h(d.artigo || '?') + '</b>' + (d.lote ? ' lote ' + h(d.lote) : '') + (d.caixas != null ? ' · ' + h(String(d.caixas).replace('.', ',')) + ' cx' : '') + (d.kg != null ? ' · ' + h(String(d.kg).replace('.', ',')) + ' kg' : '') + ' — ' + h(d.motivo) + (d.texto ? ' <span class="muted">(' + h(d.texto) + ')</span>' : '') + '</li>').join('') + '</ul>' : '') +
+      (L.observacoes ? '<div class="why">Dúvidas da leitura: ' + h(L.observacoes) + '</div>' : '') +
+      '<div class="why">Leitura feita por IA: confirme olhando para a guia.' + (L.problema && !(o.prep.guia) ? ' A divergência abaixo já vem preenchida com esta leitura.' : '') + '</div></div>'; }).join('');
+}
+async function verGuia(g) {
+  S.ui.guiaImgs = S.ui.guiaImgs || {};
+  if (S.ui.guiaImgs[g.id] && S.ui.guiaImgs[g.id] !== 'loading') { delete S.ui.guiaImgs[g.id]; return render(); }
+  S.ui.guiaImgs[g.id] = 'loading'; render();
+  try {
+    const r = await S.caps.mcp.callTool('Microsoft 365', 'read_resource', { uri: g.attUri }, { cache: false });
+    let b64 = r && r.payload && r.payload.contentBytes;
+    if (!b64) { try { b64 = JSON.parse(Z.resultText(r)).contentBytes; } catch (e) { b64 = null; } }
+    if (!b64) { S.ui.guiaImgs[g.id] = 'link'; return render(); }
+    const lib = await loadPdfJs();
+    const doc = await lib.getDocument({ data: Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)) }).promise;
+    const imgs = [];
+    for (let i = 1; i <= Math.min(doc.numPages, 8); i++) {
+      const pg = await doc.getPage(i); const vp = pg.getViewport({ scale: 1.5 });
+      const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
+      await pg.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+      imgs.push(cv.toDataURL('image/jpeg', 0.82));
+    }
+    S.ui.guiaImgs[g.id] = imgs;
+  } catch (e) { S.ui.guiaImgs[g.id] = 'link'; }
+  render();
+}
+function guiaHtml(o) {
+  const gs = guiasOf(o); const gv = o.prep.guia; const exige = S.cfg.exigirGuia !== false;
+  if (!exige && !gs.length) return '';
+  let out = '<div class="stack" style="gap:10px;border:1px solid var(--line);border-radius:var(--r);padding:12px 14px"><b>Guia de entrega assinada</b>';
+  if (!gs.length) return out + '<div class="why">À espera da guia assinada pelo cliente (email "Zolve Scans" da Logifrio).' + (exige ? ' Os dados só seguem para o Financeiro depois de a guia ser verificada.' : '') + '</div></div>';
+  const dev = gs.filter((g) => g.devolucao);
+  if (dev.length) out += '<div class="note bad"><b>A Logifrio registou uma devolução</b> ligada a esta encomenda (' + h(dev.map((g) => g.ficheiro).join(', ')) + '): parte ou toda a mercadoria voltou ao armazém. Veja a guia e registe o que aconteceu.</div>';
+  out += gs.map((g) => {
+    const im = S.ui.guiaImgs && S.ui.guiaImgs[g.id];
+    let x = '<div class="row" style="align-items:center"><span class="mono">' + h(g.ficheiro) + '</span><span class="muted">' + h(Z.fmtDate(g.data)) + '</span>' + (g.devolucao ? '<span class="pill st-bloqueado">Devolução</span>' : '') +
+      (g.attUri ? '<button class="btn" data-act="guia-ver" data-gid="' + h(g.id) + '">' + (im === 'loading' ? 'A abrir…' : Array.isArray(im) ? 'Esconder a guia' : 'Ver a guia') + '</button>' : '') +
+      (g.webLink ? '<a class="btn ghost" href="' + h(g.webLink) + '" target="_blank" rel="noopener">Abrir o email</a>' : '') + '</div>';
+    if (im === 'link') x += '<div class="why">Nesta versão da app não é possível mostrar o PDF aqui: use "Abrir o email" para o ver no Outlook.</div>';
+    if (Array.isArray(im)) x += '<div class="stack" style="gap:8px">' + im.map((src, i) => '<img alt="Guia ' + h(g.ficheiro) + ', página ' + (i + 1) + '" src="' + src + '" style="width:100%;max-width:820px;border:1px solid var(--line);border-radius:6px;background:#fff">').join('') + '</div>';
+    return x;
+  }).join('');
+  out += guiaLeituraHtml(o);
+  // O que foi preparado, para comparar com a guia.
+  const linhas = Z.latestPreps(prepsOf(o)).flatMap((p) => p.lines || []);
+  if (linhas.length) out += '<details><summary>Comparar com a preparação (' + fmtN(linhas.reduce((t, l) => t + (l.cases || 0), 0)) + ' cx · ' + h(Z.fmtKg(linhas.reduce((t, l) => t + (l.weight || 0), 0))) + ')</summary><div class="tbl-wrap" style="margin-top:8px"><table><thead><tr><th>Artigo</th><th>Descrição</th><th>Lote</th><th>Validade</th><th style="text-align:right">Cx</th><th style="text-align:right">Kg</th></tr></thead><tbody>' +
+    linhas.map((l) => '<tr><td class="mono">' + h(l.article) + '</td><td>' + h(l.name || '') + '</td><td class="mono">' + h(l.lot || '') + '</td><td>' + h(Z.fmtDate(l.bbd)) + '</td><td style="text-align:right">' + fmtN(l.cases) + '</td><td style="text-align:right">' + h(Z.fmtKg(l.weight)) + '</td></tr>').join('') + '</tbody></table></div></details>';
+  if (gv && gv.estado === 'problema' && S.ui.guiaProb !== o.id) {
+    out += '<div class="note warn"><b>Divergência na guia de entrega</b> (' + h(gv.porNome || who(gv.by)) + ', ' + h(fmtDT(gv.at)) + ') · decisão para o Financeiro: <b>' + h(GUIA_DECISAO[gv.decisao || 'nao'].curto) + '</b>' +
+      ((gv.linhas || []).length ? '<div class="tbl-wrap" style="margin-top:8px"><table><thead><tr><th>Artigo</th><th>Lote</th><th class="num">Não faturar</th><th>Motivo</th></tr></thead><tbody>' + gv.linhas.map((l) => '<tr><td><b class="mono">' + h(l.article) + '</b><div class="why">' + h(l.name || '') + '</div></td><td class="mono">' + h(l.lot || '') + '</td><td class="num">' + (l.cxNF ? fmtN(l.cxNF) + ' cx · ' : '') + h(Z.fmtKg(l.kgNF)) + '</td><td>' + h(l.motivo) + '</td></tr>').join('') + '</tbody></table></div>' : '') +
+      (gv.notas ? '<div>Motivo / observações: ' + h(gv.notas) + '</div>' : '') +
+      (gv.resolvido ? '<div><b>Resolvido</b> (' + h(gv.resolvido.porNome || '') + ', ' + h(fmtDT(gv.resolvido.at)) + ')' + (gv.resolvido.nota ? ': ' + h(gv.resolvido.nota) : '') + '</div>' : '') +
+      (!o.prep.financeiro ? '<div>Ainda não foi enviado ao Financeiro: use <b>Enviar ao Financeiro</b> (a decisão e os motivos vão no email).</div>' : '') + '</div>';
+    if (canWriteData()) out += '<div class="row"><button class="btn ghost" data-act="guia-prob-edit">Alterar a divergência</button>' + (o.prep.financeiro ? '' : '<button class="btn ghost" data-act="guia-reabrir">Anular a verificação</button>') + '</div>';
+  } else if (S.ui.guiaProb === o.id && canWriteData()) {
+    out += guiaProbForm(o);
+  } else if (gv) {
+    out += '<div class="note ' + (gv.estado === 'ok' ? 'ok' : 'warn') + '">' + (gv.estado === 'ok' ? '<b>Guia verificada:</b> assinada pelo cliente, sem anotações de quantidades ou de qualidade' : '<b>Guia com anotações:</b> ' + h(gv.notas || '')) + ' (' + h(gv.porNome || who(gv.by)) + ', ' + h(fmtDT(gv.at)) + ').' + (gv.estado === 'ok' && gv.notas ? ' Nota: ' + h(gv.notas) : '') + '</div>';
+    if (canWriteData() && !o.prep.financeiro) out += '<div class="row"><button class="btn ghost" data-act="guia-reabrir">Alterar a verificação</button></div>';
+  } else if (canWriteData()) {
+    out += '<div class="stack" style="gap:6px"><div class="muted">Veja a guia e confirme:</div>' +
+      '<label class="check"><input type="checkbox" id="gchk-ass"> Está assinada pelo cliente</label>' +
+      '<label class="check"><input type="checkbox" id="gchk-qtd"> Sem anotações de quantidades (as caixas e os lotes batem com a preparação)</label>' +
+      '<label class="check"><input type="checkbox" id="gchk-qual"> Sem anotações de problemas de qualidade</label>' +
+      '<div class="row"><button class="btn primary" data-act="guia-ok"' + (S.ui.busy ? ' disabled' : '') + '>Guia confere' + (exige && !o.prep.financeiro && S.cfg.financeiroAuto !== false ? ': enviar ao Financeiro' : '') + '</button><button class="btn" data-act="guia-prob-edit"' + (S.ui.busy ? ' disabled' : '') + '>Há divergências na guia</button></div></div>';
+  }
+  return out + '</div>';
+}
+/* ---------- Divergências na guia de entrega ----------
+   Quem verifica a guia indica, por artigo/lote, o que NÃO deve ser faturado e porquê, e a decisão para o Financeiro
+   (faturar tudo, faturar só o aceite, não faturar). Segue no email ao Financeiro para faturar já certo e evitar notas de crédito. */
+const GUIA_MOTIVOS = ['Devolvido / recusado pelo cliente', 'Produto danificado / embalagem', 'Problema de qualidade / temperatura', 'Validade curta', 'Faltou na entrega', 'Artigo ou lote trocado', 'Erro de preparação (Logifrio)', 'Atraso na entrega', 'Outro'];
+const GUIA_DECISAO = {
+  parcial: { curto: 'Faturar só o aceite', longo: 'Faturar só o que o cliente aceitou (desconta o que está abaixo)', email: 'FATURAR COM ACERTOS', cor: '#FCEBD9' },
+  nao: { curto: 'Não faturar (aguardar)', longo: 'Não faturar por agora: esperar pela resolução', email: 'NÃO FATURAR', cor: '#FDE2E1' },
+  tudo: { curto: 'Faturar tudo', longo: 'Faturar tudo: a anotação não altera a fatura', email: 'FATURAR TUDO', cor: '#E3F1E6' },
+};
+const guiaLinhas = (o) => Z.latestPreps(prepsOf(o)).flatMap((p) => p.lines || []);
+const numPt = (v) => { const n = parseFloat(String(v == null ? '' : v).replace(/\s/g, '').replace(',', '.')); return isFinite(n) && n > 0 ? n : 0; };
+function guiaProbForm(o) {
+  const gv = (o.prep.guia && o.prep.guia.estado === 'problema') ? o.prep.guia : {};
+  const ant = gv.linhas || []; const dec = gv.decisao || 'parcial';
+  const linhas = guiaLinhas(o);
+  // Sem divergência registada: parte da leitura automática da guia (se houver).
+  const gl = !ant.length && guiaLida(o); const lidas = gl ? (gl.leitura.divergencias || []).map((d) => Object.assign({}, d)) : [];
+  const deLeitura = (l) => { const i = lidas.findIndex((d) => d.artigo === l.article && (!d.lote || !l.lot || d.lote === l.lot)); if (i < 0) return null; const d = lidas.splice(i, 1)[0]; return d.caixas != null ? { cxNF: d.caixas, unidade: 'cx', motivo: d.motivo } : d.kg != null ? { kgNF: d.kg, unidade: 'kg', motivo: d.motivo } : { motivo: d.motivo }; };
+  const prevOf = (l) => ant.find((x) => x.article === l.article && (x.lot || '') === (l.lot || '')) || (gl && deLeitura(l)) || {};
+  return '<div class="stack" style="gap:10px;border:2px solid var(--warn);border-radius:var(--r);padding:12px 14px"><b>Divergências na guia de entrega</b>' +
+    '<div class="why">Indique, por artigo, o que <b>não</b> deve ser faturado (em caixas <b>ou</b> em kg, à escolha) e o motivo. Deixe em branco o que foi aceite.</div>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>Artigo</th><th>Lote</th><th class="num">Preparado</th><th class="num">Não faturar</th><th>Motivo</th></tr></thead><tbody>' +
+    linhas.map((l, i) => { const pv = prevOf(l); return '<tr><td><b class="mono">' + h(l.article) + '</b><div class="why">' + h(l.name || '') + '</div></td><td class="mono">' + h(l.lot || '') + '</td><td class="num">' + fmtN(l.cases) + ' cx<div class="why">' + h(Z.fmtKg(l.weight)) + '</div></td>' +
+      (() => { const u = pv.unidade || (pv.cxNF ? 'cx' : pv.kgNF ? 'kg' : 'cx'); const v = u === 'cx' ? (pv.cxNF || '') : (pv.kgNF ? String(pv.kgNF).replace('.', ',') : '');
+        return '<td class="num"><div class="row" style="flex-wrap:nowrap;gap:4px;justify-content:flex-end"><input id="gnf-q-' + i + '" inputmode="decimal" style="width:80px;text-align:right" value="' + h(v) + '" aria-label="Quantidade a não faturar de ' + h(l.article) + '">' +
+          '<select id="gnf-u-' + i + '" style="width:auto" aria-label="Unidade"><option value="cx"' + (u === 'cx' ? ' selected' : '') + '>cx</option><option value="kg"' + (u === 'kg' ? ' selected' : '') + '>kg</option></select></div></td>'; })() +
+      '<td><select id="gnf-m-' + i + '" aria-label="Motivo ' + h(l.article) + '"><option value="">—</option>' + GUIA_MOTIVOS.map((m) => '<option' + (pv.motivo === m ? ' selected' : '') + '>' + h(m) + '</option>').join('') + '</select></td></tr>'; }).join('') +
+    '</tbody></table></div>' +
+    '<fieldset style="border:0;padding:0;margin:0"><legend class="muted" style="margin-bottom:4px">Decisão para o Financeiro</legend>' +
+    Object.keys(GUIA_DECISAO).map((k) => '<label class="check"><input type="radio" name="gdec" value="' + k + '"' + (dec === k ? ' checked' : '') + '> ' + h(GUIA_DECISAO[k].longo) + '</label>').join('') + '</fieldset>' +
+    '<label class="f full">Motivo / observações (vai no email ao Financeiro)<textarea id="gnotas" rows="2" placeholder="Ex.: cliente recusou 2 cx de TBB004 por embalagem danificada; a Logifrio vai recolher.">' + h(gv.notas || (gl && gl.leitura.transcricao ? 'Na guia: ' + gl.leitura.transcricao : '')) + '</textarea></label>' +
+    '<div class="row"><button class="btn primary" data-act="guia-prob-send"' + (S.ui.busy || !S.caps.mcp ? ' disabled' : '') + '>Registar e enviar ao Financeiro</button><button class="btn" data-act="guia-prob"' + (S.ui.busy ? ' disabled' : '') + '>Só registar</button><button class="btn ghost" data-act="guia-prob-cancel">Cancelar</button></div></div>';
+}
+function guiaProbRead(o) {
+  const linhas = guiaLinhas(o); const out = []; const erros = [];
+  linhas.forEach((l, i) => {
+    const q = numPt(($('#gnf-q-' + i) || {}).value); const unidade = ($('#gnf-u-' + i) || {}).value === 'kg' ? 'kg' : 'cx'; const motivo = ($('#gnf-m-' + i) || {}).value || '';
+    let cx = unidade === 'cx' ? q : 0, kg = unidade === 'kg' ? q : 0;
+    if (!q) { if (motivo) erros.push(l.article + ': escolheu um motivo mas não indicou a quantidade.'); return; }
+    if (cx > (l.cases || 0) && l.cases) erros.push(l.article + ': mais caixas (' + cx + ') do que as preparadas (' + l.cases + ').');
+    if (!kg && cx && l.cases) kg = Z.round3((l.weight || 0) * Math.min(cx, l.cases) / l.cases);
+    if (kg > (l.weight || 0) + 0.001 && l.weight) erros.push(l.article + ': mais kg (' + kg + ') do que os preparados (' + Z.round3(l.weight) + ').');
+    if (!motivo) erros.push(l.article + ': falta o motivo.');
+    out.push({ article: l.article, name: l.name || '', lot: l.lot || '', cxPrep: l.cases || 0, kgPrep: Z.round3(l.weight || 0), cxNF: cx, kgNF: Z.round3(kg), unidade, motivo });
+  });
+  const r = document.querySelector('input[name="gdec"]:checked'); const decisao = r ? r.value : 'parcial';
+  const notas = String(($('#gnotas') || {}).value || '').trim();
+  if (decisao === 'parcial' && !out.length) erros.push('Para "faturar só o aceite", indique o que não se fatura.');
+  if (decisao !== 'parcial' && !notas && !out.length) erros.push('Escreva o motivo.');
+  return { linhas: out, decisao, notas, erros };
+}
+async function guiaVerificada(o, estado) {
+  if (window.__svRobot || !canWriteData() || !guiasOf(o).length) return toast('Abra a guia antes de confirmar.');
+  const ass = $('#gchk-ass'), qtd = $('#gchk-qtd'), qual = $('#gchk-qual'); const notas = String(($('#gnotas') || {}).value || '').trim();
+  if (estado === 'ok' && !(ass && ass.checked && qtd && qtd.checked && qual && qual.checked)) return toast('Confirme as três verificações (assinada, quantidades e qualidade) ou use "Registar problema".');
+  let pr = null;
+  if (estado === 'problema') { pr = guiaProbRead(o); if (pr.erros.length) return toast(pr.erros.slice(0, 3).join(' ')); }
+  const me = identity();
+  o.prep.guia = { estado, at: new Date().toISOString(), by: S.me.id, porNome: me.nome || '', ficheiros: guiasOf(o).map((g) => g.ficheiro), assinada: !!(ass && ass.checked), notas: pr ? pr.notas : notas };
+  if (pr) Object.assign(o.prep.guia, { decisao: pr.decisao, linhas: pr.linhas, kgNF: Z.round3(pr.linhas.reduce((t, l) => t + l.kgNF, 0)) });
+  S.ui.guiaProb = null;
+  Z.addHistory(o, S.me.id, estado === 'ok' ? 'Guia de entrega verificada' : 'Divergência na guia: ' + GUIA_DECISAO[pr.decisao].curto, o.prep.guia.ficheiros.join(', ') + (pr ? pr.linhas.map((l) => ' · ' + l.article + ' ' + Z.fmtKg(l.kgNF) + ' (' + l.motivo + ')').join('') : '') + (o.prep.guia.notas ? ' · ' + o.prep.guia.notas : ''));
+  await persistOrder(o);
+  if (estado === 'problema' && arguments[2] === 'enviar') return sendFinance(o, false, true);
+  if (estado === 'ok' && !o.prep.financeiro && S.cfg.financeiroAuto !== false && ['ok', 'corrigida'].includes(o.prep.status) && canWriteData()) {
+    S.ui.busy = true; render();
+    try { const r = await sendFinance(o, true); toast(r === true ? 'Guia verificada. Dados enviados ao Financeiro' + (o.prep.notaCliente ? ' e nota enviada ao cliente.' : o.prep.notaPendente ? '; a nota ao cliente ficou para aprovação.' : '.') : r === false ? 'Guia verificada, mas o envio ao Financeiro falhou: use o botão.' : 'Guia verificada.'); }
+    finally { S.ui.busy = false; render(); }
+  } else { toast(estado === 'ok' ? 'Guia verificada.' : 'Divergência registada. O Financeiro não recebe os dados sozinho: use "Enviar ao Financeiro".'); render(); }
+}
+function guiaConfirmadaParaFinanceiro(o) {
+  const guia = o?.prep?.guia;
+  return !!(guia?.by && guia.at && guia.ficheiros?.length &&
+    (guia.estado === 'ok' || (guia.estado === 'problema' && ['parcial', 'tudo'].includes(guia.decisao))));
+}
 async function sendFinance(o, auto) {
+  if (!guiaConfirmadaParaFinanceiro(o)) return auto ? null : toast('Confirme a guia antes de enviar ao Financeiro.');
   const preps = prepsOf(o); const cmp = Z.comparePreparation(o, preps);
   if (!(o.prep && (o.prep.status === 'ok' || o.prep.status === 'corrigida'))) return auto ? null : toast('A preparação ainda tem divergências por resolver.');
   const em = Z.financeEmail(o, preps, cmp, S.cfg, S.precos);
+  const guia = o.prep.guia;
+  if (guia.estado === 'problema') {
+    em.html = '<p><b>Divergência confirmada na guia. Decisão: ' + h(GUIA_DECISAO[guia.decisao].curto) + '</b></p>' +
+      '<p>' + h(guia.notas || '') + '</p><ul>' + (guia.linhas || []).map(l =>
+        '<li>' + h(l.article) + ' · ' + h(l.lot || '') + ' · ' + h(Z.fmtKg(l.kgNF)) + ' · ' + h(l.motivo) + '</li>').join('') + '</ul>' + em.html;
+  }
   const to = String(S.cfg.emailFinanceiro || 'financeiro@montedopasto.pt').split(/[;,\s]+/).filter(Boolean);
   const me = identity();
   if (auto) {
@@ -2282,7 +2568,7 @@ async function sendFinance(o, auto) {
       delete o.prep.financeiroErro;
       Z.addHistory(o, S.me.id, 'Dados enviados ao Financeiro (automático)', to.join(', ') + ' · ' + cmp.totalCx + ' cx · ' + String(cmp.totalKg).replace('.', ',') + ' kg · a preparação confere');
       await persistOrder(o);
-      if (S.cfg.notaClienteAuto !== false) await sendClientNote(o, true);
+      if (o.prep.guia.estado === 'ok' && S.cfg.notaClienteAuto !== false) await sendClientNote(o, true);
       return true;
     } catch (e) { o.prep.financeiroErro = { at: new Date().toISOString(), msg: MS_ERR(e, 'enviar o email') }; await persistOrder(o); return false; }
   }
@@ -2294,7 +2580,7 @@ async function sendFinance(o, auto) {
     delete o.prep.financeiroErro;
     Z.addHistory(o, S.me.id, 'Dados enviados ao Financeiro', to.join(', ') + ' · ' + cmp.totalCx + ' cx · ' + String(cmp.totalKg).replace('.', ',') + ' kg');
     await persistOrder(o);
-    let nota = null; if (S.cfg.notaClienteAuto !== false && !o.prep.notaCliente) nota = await sendClientNote(o, true);
+    let nota = null; if (o.prep.guia.estado === 'ok' && S.cfg.notaClienteAuto !== false && !o.prep.notaCliente) nota = await sendClientNote(o, true);
     toast('Enviado ao Financeiro.' + (nota === true ? ' Nota de encomenda enviada ao cliente.' : nota === 'pendente' ? ' A nota ao cliente tem dúvidas nos preços: ficou à espera de aprovação.' : nota === false ? ' A nota ao cliente não foi enviada (ver a encomenda).' : ''));
   } catch (e) { toast('Não foi possível enviar ao Financeiro: ' + MS_ERR(e, 'enviar o email')); }
   finally { S.ui.busy = false; render(); }
@@ -2420,10 +2706,11 @@ function prepPanel(o) {
       if (canWriteData()) out += '<div class="row"><button class="btn" data-act="prep-accept"' + (S.ui.busy ? ' disabled' : '') + '>A preparação está certa: corrigir a encomenda</button><button class="btn primary" data-act="prep-correct"' + (S.caps.mcp && !S.ui.busy ? '' : ' disabled') + '>Pedir correção à Logifrio</button></div>';
     } else if (st === 'ok' || st === 'corrigida') {
       out += '<div class="note ok"><b>' + (st === 'ok' ? 'A preparação confere com a encomenda.' : 'Encomenda corrigida para a preparação (' + h(fmtDT(o.prep.aceite.at)) + ', ' + h(who(o.prep.aceite.by)) + ').') + '</b></div>';
+      out += guiaHtml(o);
       out += prepValorHtml(o);
       if (o.prep.financeiro) out += '<div class="note info">Dados enviados ao Financeiro (' + h((o.prep.financeiro.para || []).join(', ')) + ') a ' + h(fmtDT(o.prep.financeiro.at)) + ' por ' + h(who(o.prep.financeiro.by)) + (o.prep.financeiro.auto ? ', automaticamente porque a preparação confere' : '') + '.</div>';
       else if (o.prep.financeiroErro) out += '<div class="note warn">O envio automático ao Financeiro falhou (' + h(fmtDT(o.prep.financeiroErro.at)) + '): ' + h(o.prep.financeiroErro.msg) + ' Use o botão abaixo.</div>';
-      else if (st === 'ok' && S.cfg.financeiroAuto !== false) out += '<div class="why">Como a preparação confere, os dados seguem sozinhos para o Financeiro na próxima procura de relatórios (ou use já o botão).</div>';
+      else if (guiaConfirmadaParaFinanceiro(o) && st === 'ok' && S.cfg.financeiroAuto !== false) out += '<div class="why">Como a preparação confere, os dados seguem sozinhos para o Financeiro na próxima procura de relatórios (ou use já o botão).</div>';
       if (o.prep.notaCliente) out += '<div class="note info">Nota de encomenda enviada ao cliente (' + h((o.prep.notaCliente.para || []).join(', ')) + ') a ' + h(fmtDT(o.prep.notaCliente.at)) + (o.prep.notaCliente.auto ? ', automaticamente' : ' por ' + h(who(o.prep.notaCliente.by))) + '.</div>';
       else if (o.prep.notaPendente) out += notaPendenteHtml(o);
       else if (o.prep.notaClienteErro) out += '<div class="note warn">A nota de encomenda não foi enviada ao cliente (' + h(fmtDT(o.prep.notaClienteErro.at)) + '): ' + h(o.prep.notaClienteErro.msg) + (/sem email|não tem email/i.test(o.prep.notaClienteErro.msg) ? ' Acrescente o email na lista de clientes (ou nos dados do cliente da encomenda) e use o botão abaixo.' : ' Use o botão abaixo.') + '</div>';
@@ -4039,6 +4326,13 @@ document.addEventListener('click', async (ev) => {
     }
     case 'prep-accept': return acceptPrep(S.edit);
     case 'prep-correct': return askCorrection(S.edit);
+    case 'guia-ver': { const g = (S.guias || []).find((x) => x.id === d.gid); return g ? verGuia(g) : null; }
+    case 'guia-ok': return guiaVerificada(S.edit, 'ok');
+    case 'guia-prob': return guiaVerificada(S.edit, 'problema');
+    case 'guia-prob-send': return guiaVerificada(S.edit, 'problema', 'enviar');
+    case 'guia-prob-edit': S.ui.guiaProb = S.edit && S.edit.id; return render();
+    case 'guia-prob-cancel': S.ui.guiaProb = null; return render();
+    case 'guia-reabrir': { const o = S.edit; if (!o || !o.prep || o.prep.financeiro) return; delete o.prep.guia; Z.addHistory(o, S.me.id, 'Verificação da guia anulada', ''); await persistOrder(o); return render(); }
     case 'prep-finance': return sendFinance(S.edit);
     case 'prep-client-note': return sendClientNote(S.edit, false);
     case 'save-perfil': return savePerfil();
