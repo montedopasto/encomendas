@@ -109,7 +109,13 @@ async function run() {
     await page.exposeFunction('__svRobotToken', token);
     if (process.env.GEMINI_API_KEY) {
       const { criarLeitor } = require('./ler-guia');
-      await page.exposeFunction('__svLerGuia', criarLeitor(process.env.GEMINI_API_KEY));
+      const ler = criarLeitor(process.env.GEMINI_API_KEY);
+      await page.exposeFunction('__svLerGuia', (pedido) => ler({
+        ...pedido,
+        imagens: Array.isArray(pedido?.imagens) ? pedido.imagens.map(imagem =>
+          typeof imagem === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(imagem)
+            ? 'data:image/jpeg;base64,' + imagem : imagem) : pedido?.imagens,
+      }));
     }
     await page.addInitScript((address) => {
       window.__svRobot = { mailbox: address, nome: 'Robô Encomendas' };
